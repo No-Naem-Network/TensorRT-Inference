@@ -11,12 +11,15 @@ import cv2
 from models.retinaface import RetinaFace
 from utils.box_utils import decode, decode_landm
 import time
+import onnx
+import onnxruntime
+
 
 parser = argparse.ArgumentParser(description='Retinaface')
 
-parser.add_argument('-m', '--trained_model', default='./weights/Resnet50_Final.pth',
+parser.add_argument('-m', '--trained_model', default='models/weights/mobilenet0.25_Final.pth',
                     type=str, help='Trained state_dict file path to open')
-parser.add_argument('--network', default='resnet50', help='Backbone network mobile0.25 or resnet50')
+parser.add_argument('--network', default='mobile0.25', help='Backbone network mobile0.25 or resnet50')
 parser.add_argument('--cpu', action="store_true", default=False, help='Use cpu inference')
 parser.add_argument('--confidence_threshold', default=0.02, type=float, help='confidence_threshold')
 parser.add_argument('--top_k', default=5000, type=int, help='top_k')
@@ -26,6 +29,8 @@ parser.add_argument('-s', '--save_image', action="store_true", default=True, hel
 parser.add_argument('--vis_thres', default=0.6, type=float, help='visualization_threshold')
 args = parser.parse_args()
 
+def to_numpy(tensor):
+    return tensor.deteach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
 
 def check_keys(model, pretrained_state_dict):
     ckpt_keys = set(pretrained_state_dict.keys())
@@ -47,12 +52,11 @@ def remove_prefix(state_dict, prefix):
     return {f(key): value for key, value in state_dict.items()}
 
 
-def load_model(model, pretrained_path, load_to_cpu):
+def load_model(model, pretrained_path, load_to_cpu, device):
     print('Loading pretrained model from {}'.format(pretrained_path))
     if load_to_cpu:
         pretrained_dict = torch.load(pretrained_path, map_location=lambda storage, loc: storage)
     else:
-        device = torch.cuda.current_device()
         pretrained_dict = torch.load(pretrained_path, map_location=lambda storage, loc: storage.cuda(device))
     if "state_dict" in pretrained_dict.keys():
         pretrained_dict = remove_prefix(pretrained_dict['state_dict'], 'module.')
@@ -62,30 +66,39 @@ def load_model(model, pretrained_path, load_to_cpu):
     model.load_state_dict(pretrained_dict, strict=False)
     return model
 
-
+providers = [
+    ('CUDAExecutionProvider', {
+        'device_id': 1,
+    }),
+    'CPUExecutionProvider',
+]
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
     cfg = None
+    device = torch.device("cpu" if args.cpu else "cuda:1")
+
     if args.network == "mobile0.25":
         cfg = cfg_mnet
     elif args.network == "resnet50":
         cfg = cfg_re50
     # net and model
     net = RetinaFace(cfg=cfg, phase = 'test')
-    net = load_model(net, args.trained_model, args.cpu)
+    net = load_model(net, args.trained_model, args.cpu, device)
     net.eval()
     print('Finished loading model!')
-    print(net)
+    # print(net)
     cudnn.benchmark = True
-    device = torch.device("cpu" if args.cpu else "cuda")
     net = net.to(device)
-
+    # ort_session = onnxruntime.InferenceSession('models/weights/Retinaface_m25_dynamic_batch.onnx', providers=providers)
+    # ort_session = onnxruntime.InferenceSession('models/weights/Retinaface_m25.onnx', providers=providers)
     resize = 1
 
     # testing begin
-    for i in range(100):
+    for i in range(20):
         image_path = "./curve/test.jpg"
         img_raw = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        start = time.time()
+        img_raw = cv2.resize(img_raw, (640, 640))
 
         img = np.float32(img_raw)
 
@@ -94,12 +107,24 @@ if __name__ == '__main__':
         img -= (104, 117, 123)
         img = img.transpose(2, 0, 1)
         img = torch.from_numpy(img).unsqueeze(0)
-        img = img.to(device)
+        img = torch.vstack((img, img, img, img))
         scale = scale.to(device)
-
+        img = img.to(device)
         tic = time.time()
+        print("Pre processing time: ", tic - start)
+
+
         loc, conf, landms = net(img)  # forward pass
-        print('net forward time: {:.4f}'.format(time.time() - tic))
+        # loc, conf, landms = ort_session.run(None, {'input': to_numpy(img)})
+        model_time = time.time()
+        print('net forward time', model_time - tic)
+
+        loc = torch.tensor(loc[0]).unsqueeze(0).to(device)
+        conf = torch.tensor(conf[0]).unsqueeze(0).to(device)
+        landms = torch.tensor(landms[0]).unsqueeze(0).to(device)
+        print(loc.shape)
+        print(conf.shape)
+        print(landms.shape)
 
         priorbox = PriorBox(cfg, image_size=(im_height, im_width))
         priors = priorbox.forward()
@@ -141,7 +166,9 @@ if __name__ == '__main__':
         landms = landms[:args.keep_top_k, :]
 
         dets = np.concatenate((dets, landms), axis=1)
-
+        end = time.time()
+        print("Post process time: ", end - model_time)
+        print("total: ", end - start)
         # show image
         if args.save_image:
             for b in dets:
